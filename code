@@ -1,0 +1,1847 @@
+/* ----------------------------------------------------------------------
+
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   http://lammps.sandia.gov, Sandia National Laboratories
+   Steve Plimpton, sjplimp@sandia.gov
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------
+   Contributing authors: Leo Silbert (SNL), Gary Grest (SNL)
+------------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------
+   Edited by Bryan Kuhr (SNL) to accomodate "gran/ep/history"
+   Edited by Isaiah Kim (UIUC/NAVAIR) to calculate energies dissipated by
+      plasticity and friction (May 2017)
+   Edited by Isaiah Kim (UIUC/NAVAIR) to calculate strain energy (Jul 2019)
+   Created by Devanjith Fonseka (UIUC Geubelle group) in June 2022
+------------------------------------------------------------------------- */
+
+#include "math.h"
+#include "stdlib.h"
+#include "stdio.h"
+#include "string.h"
+#include "pair_gran_ep_history_r_calc.h"
+#include "atom.h"
+#include "update.h"
+#include "force.h"
+#include "fix.h"
+#include "neighbor.h"
+#include "neigh_list.h"
+#include "comm.h"
+#include "memory.h"
+#include "error.h"
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+#include <cstring>
+#include "math_const.h"
+#include "compute.h"
+#include <fstream>
+#include <string>     
+#include <sstream>
+#include <cmath>
+
+using namespace LAMMPS_NS;
+using namespace std;
+using namespace MathConst;//f
+namespace patch
+{
+    template < typename T > std::string to_string( const T& n )
+    {
+        std::ostringstream stm ;
+        stm << n ;
+        return stm.str() ;
+    }
+}
+
+/* ---------------------------------------------------------------------- */
+
+
+PairGranEPHistoryRCalc::PairGranEPHistoryRCalc(LAMMPS *lmp) :
+    PairGranHookeHistory(lmp) {
+      delete svector;
+      single_extra = 15;
+      svector = new double[15];
+    }
+	
+/* ---------------------------------------------------------------------- */
+
+void PairGranEPHistoryRCalc::compute(int eflag, int vflag)
+{
+  int i,j,ii,jj,inum,jnum,itype,jtype;
+  double xtmp,ytmp,ztmp,delx,dely,delz,fx,fy,fz;
+  double radi,radj,radsum,rsq,r,rinv,rsqinv;
+  double vr1,vr2,vr3,vnnr,vn1,vn2,vn3,vt1,vt2,vt3;
+  double wr1,wr2,wr3;
+  double vtr1,vtr2,vtr3,vrel;
+  double mi,mj,meff,damp,ccel,tor1,tor2,tor3;
+  double fn,fs,fs1,fs2,fs3;
+  double shrmag,rsht,polyhertz;
+  int *ilist,*jlist,*numneigh,**firstneigh;
+  int *touch,**firsttouch;
+  double *shear,*allshear,**firstshear;
+  double reff,delta,deltay,deltap,carad,carady,caradp,phi1,phi2;
+  double deltamax,deltabar,reffbar,Fmax;
+  
+
+  if (eflag || vflag) ev_setup(eflag,vflag);
+  else evflag = vflag_fdotr = 0;
+
+  computeflag = 1;
+  int shearupdate = 1;
+  if (update->setupflag) shearupdate = 0;
+
+  // update rigid body info for owned & ghost atoms if using FixRigid masses
+  // body[i] = which body atom I is in, -1 if none
+  // mass_body = mass of each rigid body
+
+  if (fix_rigid && neighbor->ago == 0) {
+    int tmp;
+    int *body = (int *) fix_rigid->extract("body",tmp);
+    double *mass_body = (double *) fix_rigid->extract("masstotal",tmp);
+    if (atom->nmax > nmax) {
+      memory->destroy(mass_rigid);
+      nmax = atom->nmax;
+      memory->create(mass_rigid,nmax,"pair:mass_rigid");
+    }
+    int nlocal = atom->nlocal;
+    for (i = 0; i < nlocal; i++)
+      if (body[i] >= 0) mass_rigid[i] = mass_body[body[i]];
+      else mass_rigid[i] = 0.0;
+    comm->forward_comm_pair(this);
+  }
+
+  double **x = atom->x;
+  double **v = atom->v;
+  double **f = atom->f;
+  
+  double **omega = atom->omega;
+  double **torque = atom->torque;
+  double *radius = atom->radius;
+  double *rmass = atom->rmass;
+  double *mass = atom->mass;
+  int *type = atom->type;
+  int *mask = atom->mask;
+  int nlocal = atom->nlocal;
+  int nmax=atom->nmax;
+  
+
+  // Added by Isaiah to define energies by plasticity and friction
+  double *energy_plastic = atom->energy_plastic;
+  double *energy_friction = atom->energy_friction;
+  double *trunc_rad = atom ->trunc_rad; //added by Devanjith - > look up peratomstress 
+  double *cont_press=atom->cont_press;
+  int **contact_j = atom->contact_j;
+  double **contact_delta = atom->contact_delta;
+  double **contact_force = atom->contact_force;
+  double *original_rad=atom->original_rad;
+  double *energy_max_strain=atom->energy_max_strain;
+  double *voro_data=atom->voro_data; //added by Devanjith but not allocated
+  double *loading_work=atom->loading_work;
+  double *energy_straing=atom->energy_straing;
+  double *energy_plasticg=atom->energy_plasticg;
+  double energy_plastic_neigh;
+  
+  int contact_j_new[12];
+  double contact_delta_new[12];
+  double contact_force_new[36];
+  int k,jt,contact_n;
+  int plastic_calc_n;
+  double plastic_calc_energy_loading,plastic_calc_delta,plastic_calc_polyhertz,plastic_calc_phi1,plastic_calc_phi2,plastic_calc_carad,plastic_calc_force;
+  
+  double oldfx,curfx,olddx,curdx,deldx,cur_F;
+  double energy_plastic_loading;
+  
+  // Added by Isaiah to define strain energy
+  double *energy_strain = atom->energy_strain;
+  double energy_strain_neigh;
+  double max_energy_strain_neigh;
+
+  inum = list->inum;
+  ilist = list->ilist;
+  numneigh = list->numneigh;
+  firstneigh = list->firstneigh;
+  firsttouch = list->listgranhistory->firstneigh;
+  firstshear = list->listgranhistory->firstdouble;
+  int newton_pair = force->newton_pair;
+  
+  tagint *tag = atom->tag;
+  
+  //int storefix = modify ->find_fix('storefix');
+  
+  // Added by Devanjith to store original_rad
+  string storefixstring = "storefix";
+  int nstorefixstring=storefixstring.length();
+  
+  char char_storefixstring_array[nstorefixstring+1];
+  strcpy(char_storefixstring_array,storefixstring.c_str());
+  int storefix = modify ->find_fix(char_storefixstring_array);
+  Fix *f_storefix;
+  
+  f_storefix=modify->fix[storefix];
+  
+  double *original_rad_vec=f_storefix->vector_atom;
+  int fixcol=f_storefix->size_peratom_cols;
+  
+  //end of storing original rad
+  
+  
+    // Added by Devanjith to compute voronoi volume
+  string vorocomputestring = "computevoronoi";
+  int nvorocomputestring=vorocomputestring.length(); 
+  char char_vorocomputestring_array[nvorocomputestring+1];
+  strcpy(char_vorocomputestring_array,vorocomputestring.c_str()); 
+  int vorocompute = modify ->find_compute(char_vorocomputestring_array);  
+  
+  Compute *c_vorocompute;
+  
+  c_vorocompute=modify->compute[vorocompute];
+  c_vorocompute->compute_peratom();
+  
+  double **voro_array_use=c_vorocompute->array_atom; 
+  memory->create(old_radius,nlocal,"pair:old_radius");
+  
+  //std::cout<<"My num values inum"<<inum<<" nlocal "<<nlocal<<" nmax "<<nmax<<" ghost "<< atom->nghost<<std::endl;
+
+  
+  //std::cout<< inum<<' '<<nlocal<<' '<<nmax<<' '<<std::endl;
+  
+  double xtmpj,ytmpj,ztmpj;
+  for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  original_rad[i]=original_rad_vec[i];
+	  old_radius[i]=radius[i];
+  }  
+  
+/*   for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  jnum = numneigh[i];
+	  xtmp = x[i][0];
+	  ytmp = x[i][1];
+	  ztmp = x[i][2];
+	  
+	  for (jj = 0; jj < jnum; jj++) {
+		j = jlist[jj];
+		j &= NEIGHMASK;
+		xtmpj=x[j][0];
+		ytmpj=x[j][1];
+		ztmpj=x[j][2];
+
+		std::cout<<i<<' '<<ii<<' '<<jnum<<' '<<' '<<xtmp<<' '<<ytmp<<' '<<ztmp<<' '<<xtmpj<<' '<<ytmpj<<' '<<ztmpj<<' '<<voro_array_use[i][0]<<' '<<original_rad[i]<<std::endl;
+	  }
+  } */
+
+    // end of voronoi computation 
+  
+  std::cout<<"This is"<<' '<<update->ntimestep<<std::endl;
+  
+
+  
+  
+  nmax=atom->nmax;
+  memory->create(temp_trunc_rad,nlocal,"pair:temp_trunc_rad"); //added by Devanjith
+  memory->create(temp_s1,nlocal,"pair:temp_s1");
+  memory->create(temp_s2,nlocal,"pair:temp_s2");
+  memory->create(temp_n,nlocal,"pair:temp_n");
+  memory->create(oldep,nlocal,"pair:oldep");
+  
+/*   memory->create(temp_s,nmax,"pair:temp_s");
+  memory->create(temp_h,nmax,"pair:temp_h");
+  memory->create(temp_a,nmax,"pair:temp_a");
+  memory->create(temp_t,nmax,"pair:temp_t"); //temp shat LOL */
+  // loop over neighbors of my atoms
+  
+  
+  int cur_time = update->ntimestep;
+  int remainder=10000;
+  std::ofstream file;
+  if (cur_time % remainder==0 ){
+  std::string text = "File_";
+  std::string mystring =patch::to_string(cur_time);
+  text=text+mystring;
+  text=text+".txt";
+  std::cout<<"This is"<<' '<<text<<std::endl; 
+  
+  
+  file.open(text.c_str());
+  file<<i<<" lolol "<<std::endl;
+  }
+
+  //Second file to store the terms for the stress tensor.
+  std::ofstream file2;
+  if (cur_time % remainder==0 ){
+  std::string text2 = "File2_";
+  std::string mystring2 =patch::to_string(cur_time);
+  text2=text2+mystring2;
+  text2=text2+".txt";
+  std::cout<<"This is"<<' '<<text2<<std::endl; 
+  
+  
+  file2.open(text2.c_str());
+  file2<<i<<" lolol "<<std::endl;
+  }
+  
+  // Added by Devanjith to compute truncated radius
+  double b, s, A, h, temp_h, temp_r1, temp_r2; 
+  double cur_trunc_radi, cur_radi, cur_trunc_radj, cur_radj;
+  
+  
+  for (ii = 0; ii < inum; ii++) {
+	  temp_s1[ii]=0;
+	  temp_s2[ii]=0;
+	  temp_n[ii]=0;
+	  temp_trunc_rad[ii]=0;
+	  
+	  
+  }
+	  
+
+  
+  
+  
+  for (ii = 0; ii < inum; ii++) {
+    i = ilist[ii];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+    itype = type[i];
+    jlist = firstneigh[i];
+	
+	cur_trunc_radi=trunc_rad[i];
+	radi = radius[i];
+	radi=original_rad[i];
+	cur_radi=std::max(radi,cur_trunc_radi);
+    jnum = numneigh[i];
+/* 	std::cout<<"i loop"<<std::endl;
+	std::cout<< i <<' '<< jnum<<' ' << std::endl; */
+	int count=0;
+
+    for (jj = 0; jj < jnum; jj++) {
+/* 	  std::cout<<"j loop"; */
+      j = jlist[jj];
+      j &= NEIGHMASK;
+	  
+
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+	  xtmpj=x[j][0];
+	  ytmpj=x[j][1];
+	  ztmpj=x[j][2];
+	  
+      rsq = delx*delx + dely*dely + delz*delz;
+	  cur_trunc_radj=trunc_rad[j];
+	  radj = radius[j];
+	  radj=original_rad[j];
+	  cur_radj=std::max(radj,cur_trunc_radj);
+	  
+	  
+	  radsum=cur_radi+cur_radj;
+	  
+/* 	  b=cur_radj+cur_radi;
+	  
+	  s=(b+cur_radj+cur_radi)/2;
+	  A=sqrt(s*(s-cur_radi)*(s-cur_radj)*(s-b));
+	  h=2*A/b;
+	   */
+/* 	  std::cout<<'j loop '<< ' '<<j <<'  '<< radsum << std::endl; */
+	  //std::cout<<std::fixed<<std::setprecision(15)<<' '<<i<<' ' <<j<<' '<<xtmp<<' '<<ytmp<<' '<<ztmp<<' '<<xtmpj<<' '<<ytmpj<<' '<<ztmpj<<' '<< cur_radi<<' '<<cur_radj<<' '<<sqrt(rsq)<<' '<<radsum<<std::endl;
+
+	  
+	  //if (rsq < radsum*radsum) {
+
+      if (rsq < radsum*radsum) {
+		count+=1;
+		
+/* 		std::cout<<"radsummation loop";
+ */		
+		  
+		b=cur_radj+cur_radi;
+		b=sqrt(rsq);
+	  
+		s=(b+cur_radj+cur_radi)*0.5;
+		A=sqrt(s*(s-cur_radi)*(s-cur_radj)*(s-b));
+		h=2.0*A/b;
+		temp_h=(cur_radi*cur_radi-h*h)/(cur_radj*cur_radj-h*h);
+		
+		
+		if(b<radsum){
+		if(isnan(h)==1){
+		 std::cout<<std::fixed<<std::setprecision(15)<<" "<<tag[i]<< " "<<tag[j]<<" "<<" xtmpi "<<xtmp<<" xympi "<<ytmp<<" ztmpi "<<ztmp<<" xtmpj "<<xtmpj<<" xympj "<<ytmpj<<" ztmpj "<<ztmpj<<"h in radloop is complex "<<h<<" b "<< b <<" s "<<s<< " A "<< A<< " s-cur_radi "<<s-cur_radi<<" s-cur_radj "<<s-cur_radj<< " s-b "<<s-b<<" curradi "<<cur_radi<< " curradj "<< cur_radj<< " radsum "<<radsum<< " rsq "<<rsq<< " radsum*radsum "<<radsum*radsum<<std::endl;
+		}
+		
+		//temp_r1=sqrt(cur_radj*cur_radj*temp_h);
+		
+		//temp_r2=b-temp_r1;
+		temp_r2=b/(1.0+sqrt(temp_h));
+		temp_r1=b-temp_r2;
+		
+        temp_s1[i] += temp_r1;
+		temp_s2[i]+=temp_r1*temp_r1;
+		temp_n[i]+=1.0;
+		temp_s1[j] += temp_r2;
+		temp_s2[j]+=temp_r2*temp_r2;
+		temp_n[j]+=1.0;
+		}
+		
+		//std::cout<<std::fixed<<std::setprecision(15)<<' '<<i<<' ' <<j<<' '<<xtmp<<' '<<ytmp<<' '<<ztmp<<' '<<xtmpj<<' '<<ytmpj<<' '<<ztmpj<<' '<< cur_radi<<' '<<cur_radj<<' '<< b<<' '<<s<<' '<<h<<' '<<A<<' ' <<temp_h<<' '<<temp_r1<<' '<<temp_r2<<' '<<temp_n[i]<<' ' <<temp_s1[i]<<' ' <<temp_s2[i]<<' ' <<temp_n[j]<<' ' <<temp_s1[j]<<' ' <<temp_s2[j]<<' ' <<std::endl;
+		//std::cout<<std::fixed<<std::setprecision(15)<<' '<<i<<' '<<j<<' '<<xtmp<<' '<<ytmp<<' '<<ztmp<<' '<<xtmpj<<' '<<ytmpj<<' '<<ztmpj<<' '<< cur_radi<<' '<<cur_radj' '<<temp_n[i]<<' '<<temp_n[j]<<' ' <<temp_s1[j]<<' ' <<std::endl;
+
+		//std::cout<<' '<<i<<' '<< j <<' '<< b<<' '<<h<<' '<<A<<' ' <<temp_h<<' '<<cur_radi<<' '<< cur_radj<<' '<<temp_r1<<' '<< temp_r2 << std::endl;
+/*         if (newton_pair || j < nlocal) {
+          temp_s1[j] += temp_r2;
+		  temp_s2[j]+=temp_r2*temp_r2;
+		  temp_n[j]+=1;
+        } */
+      }
+    }
+/* 	std::cout<<'loop'<<' '<<xtmp<<' ' << ytmp <<' '<< ztmp<<' '<< count<<' '<<i<<' ' <<jnum<<' '<<temp_n[i]<<' ' <<temp_s1[i]<<' ' <<temp_s2[i]<<' ' <<temp_n[j]<<' ' <<temp_s1[j]<<' ' <<temp_s2[j]<<' ' <<std::endl;
+ */
+  }
+  
+    double b_calc, c_calc; 
+    for(ii=0;ii<inum;ii++){
+		i = ilist[ii];
+		xtmp = x[i][0];
+		ytmp = x[i][1];
+		ztmp = x[i][2];
+		itype = type[i];
+		jlist = firstneigh[i];
+		jnum = numneigh[i];
+		b_calc=(0.25)*(temp_s1[i]-temp_n[i]*original_rad[i])-original_rad[i];// checked
+		
+		c_calc=(0.25)*(original_rad[i]*temp_s1[i]-temp_s2[i]); //checked
+		//original		std::cout<<std::fixed<<std::setprecision(15)<<'print'<<' '<<xtmp<<' ' << ytmp <<' '<< ztmp<<' '<<' '<<i<<' ' <<jnum<<' '<<temp_n[i]<<' ' <<temp_s1[i]<<' ' <<temp_s2[i]<< ' '<< original_rad[i]<<' '<<(0.25)*(temp_s1[i]-temp_n[i]*original_rad[i])-original_rad[i]<<' '<<(0.25)*(original_rad[i]*temp_s1[i]-temp_s2[i])<<' '<<(-b_calc+sqrt(b_calc*b_calc-4*c_calc))/2<<' '<<' '<<temp_s1[i]-temp_n[i]*original_rad[i]<<' '<<0.25*(temp_s1[i]-temp_n[i]*original_rad[i])<<' '<<0.25*(temp_s1[i]-temp_n[i]*original_rad[i])-0.00476<<' '<<0.25*(temp_s1[i]-temp_n[i]*original_rad[i])-original_rad[i]<<' '<<(-2.25e-6)-0.00476 <<std::endl;
+
+		//std::cout<<std::fixed<<std::setprecision(15)<<'print'<<' '<<xtmp<<' ' << ytmp <<' '<< ztmp<<' '<<' '<<i<<' ' <<jnum<<' '<<temp_n[i]<<' ' <<temp_s1[i]<<' ' <<temp_s2[i]<< ' '<< original_rad[i]<<std::endl;
+	}
+	
+	  
+  
+  //double b_calc, c_calc;
+  for(ii=0;ii<inum;ii++){
+/* 	 std::cout<<"final loop"<<std::endl;
+ */	 i=ilist[ii];
+	 itype=type[i];
+ 
+ 
+	 b_calc=(0.25)*(temp_s1[i]-temp_n[i]*radius[i])-radius[i];
+	 b_calc=(0.25)*(temp_s1[i]-temp_n[i]*original_rad[i])-original_rad[i];
+	 c_calc=(0.25)*(radius[i]*temp_s1[i]-temp_s2[i]);
+	 c_calc=(0.25)*(original_rad[i]*temp_s1[i]-temp_s2[i]);
+	 temp_trunc_rad[i]=(-b_calc+sqrt(b_calc*b_calc-4.0*c_calc))*0.5;
+
+	 /* trunc_rad[ii]=1; */
+	 
+	 //trunc_rad[i]=temp_trunc_rad[i];
+	 
+	 // output this!! std::cout<<'finaloop'<<' '<<trunc_rad[i]<<' '<<b_calc<<' '<< c_calc<<std::endl;
+	 
+	 if (temp_trunc_rad[i]>trunc_rad[i]){
+		 trunc_rad[i]=temp_trunc_rad[i];
+	 }
+	 /* trunc_rad[i]=1; */
+	 if (itype==2 || itype==3){
+		 trunc_rad[i]=original_rad[i];
+	 }
+	  
+	 radius[i]=trunc_rad[i];
+	 if(isnan(radius[i])==1){
+		 std::cout<<"Radius is complex"<<std::endl;
+	 }
+	 //energy_plastic[i]=0;
+	 
+  }
+  
+ 
+/*   //int storefix = modify ->find_fix('storefix');
+  string storefixstring = "storefix";
+  int nstorefixstring=storefixstring.length();
+  
+  char char_storefixstring_array[nstorefixstring+1];
+  strcpy(char_storefixstring_array,storefixstring.c_str());
+  int storefix = modify ->find_fix(char_storefixstring_array);
+  Fix *f_storefix;
+  
+  f_storefix=modify->fix[storefix];
+  
+  original_rad=f_storefix->vector_atom;
+  int fixcol=f_storefix->size_peratom_cols;
+  
+  
+    // Added by Devanjith to compute voronoi volume
+  string vorocomputestring = "computevoronoi";
+  int nvorocomputestring=vorocomputestring.length(); 
+  char char_vorocomputestring_array[nvorocomputestring+1];
+  strcpy(char_vorocomputestring_array,vorocomputestring.c_str()); 
+  int vorocompute = modify ->find_compute(char_vorofixstring_array);  
+  
+  Compute *c_vorocompute;
+  
+  c_vorocompute=modify->compute[vorocompute]; */
+  
+  for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  
+	  //std::cout<<' '<<ii<<' '<<i<<' '<<atom->nmax<<' '<<atom->nlocal<<' '<<trunc_rad[i]<<' '<<original_rad[i]<<' '<<inum<<std::endl;
+  }
+  
+  
+  
+  
+  for (ii = 0; ii < inum; ii++) {
+	  temp_s1[ii]=0;
+	  temp_s2[ii]=0;
+	  temp_n[ii]=0;
+	  temp_trunc_rad[ii]=0;
+  }
+  
+  memory->destroy(temp_trunc_rad); //added by Devanjith 
+  memory->destroy(temp_s1);
+  memory->destroy(temp_s2);
+  memory->destroy(temp_n);
+  
+  
+  double cur_pressure;
+/*   for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  cur_pressure=pressure_fn(4.0/3.0*MY_PI*radius[i]*radius[i]*radius[i]*1.5 , 4.0/3.0*MY_PI*radius[i]*radius[i]*radius[i]);
+	  std::cout<<' '<<i<<' '<< cur_pressure<<' '<<MY_PI<<std::endl;
+  } */ 
+  
+  double contact_rad,contact_area,contact_rad_ni,contact_rad_nj,contact_area_ni,contact_area_nj;
+  
+  
+  double vorovoli,vorovolj;
+  double vp0i,vp0j;
+  double vorov_ave_ratio;
+  double cur_radi_n,cur_radj_n;
+	
+  // force calculation
+  
+   for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  energy_strain[i]=0;
+	  //loading_work[i]=0;
+	  energy_max_strain[i]=0;
+	  voro_data[i]=0;
+	  oldep[i]=energy_plastic[i];
+	  energy_straing[i]=0;
+	  vorovoli=voro_array_use[i][0];
+	  vp0i=4.0/3.0*MY_PI*pow(original_rad[i],3);
+	  vorov_ave_ratio=(vorovoli)/vp0i;
+	  cont_press[i]=pressure_fn(vorov_ave_ratio); // calculate the contact_pressure;
+	  
+	  //std::cout<<' '<<tag[i]<<' '<<energy_plastic[i]<<std::endl;
+  }
+  
+  /* 
+    for (ii = 0; ii < inum; ii++) {
+    i = ilist[ii];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+    radi = radius[i];
+    touch = firsttouch[i];
+    allshear = firstshear[i];
+    jlist = firstneigh[i];
+    jnum = numneigh[i];
+	itype=type[i];
+
+    
+    for (jj = 0; jj < jnum; jj++) {
+      j = jlist[jj];
+      jt = j;
+      j &= NEIGHMASK;
+	  jtype=type[j];
+
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+      rsq = delx*delx + dely*dely + delz*delz;
+      radj = radius[j];
+      radsum = radi + radj;
+
+
+      if (rsq >= radsum*radsum) {
+
+        // unset non-touching neighbors
+
+        touch[jj] = 0;
+        shear = &allshear[12*jj];
+        shear[0] = 0.0;
+        shear[1] = 0.0;
+        shear[2] = 0.0;
+        shear[3] = 0.0;
+        shear[4] = 0.0;
+        shear[5] = 0.0;
+        shear[6] = 0.0;
+        shear[7] = 0.0;
+		shear[8]=0.0;
+        shear[9]=0.0;
+		shear[10]=0.0;
+		shear[11]=0.0;
+
+      } else {
+        shear = &allshear[12*jj];
+		
+		std::cout<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+	}
+	}
+	}
+ */
+  
+  int howmanyint=0;
+  double oldxi,oldyi,oldzi,oldxj,oldyj,oldzj,oldfxx,oldfyy,oldfzz;
+  double aretheymovingxi,aretheymovingxj,moving_deltaij,notmoving_ij;
+  double p_it,p_imt,p_jt,p_jmt;
+  double W,W1,W2;
+  double Wl,Wu;
+  double fs_mag;
+
+  double incremental_work;
+  double tot_ep,tot_es,tot_es_max;
+  
+  double contact_number;
+  double tempr1x,tempr1y,tempr1z,tempr2x,tempr2y,tempr2z;
+  
+  for (ii = 0; ii < inum; ii++) {
+    i = ilist[ii];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+    radi = radius[i];
+    touch = firsttouch[i];
+    allshear = firstshear[i];
+    jlist = firstneigh[i];
+    jnum = numneigh[i];
+	itype=type[i];
+	vorovoli=voro_array_use[i][0];
+	vp0i=4.0/3.0*MY_PI*pow(original_rad[i],3);
+	
+
+    // Added by Isaiah
+/*     for (k = 0; k < 12; k++) {
+      contact_j_new[k] = -1;
+      contact_delta_new[k] = 0.0;
+    }
+    for (k = 0; k < 36; k++)
+      contact_force_new[k] = 0.0;
+    contact_n = 0; */
+    
+	
+	//energy_strain[i] = 0.0; I will have to uncomment this!!!
+    
+    for (jj = 0; jj < jnum; jj++) {
+      j = jlist[jj];
+      jt = j;
+      j &= NEIGHMASK;
+	  jtype=type[j];
+
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+      rsq = delx*delx + dely*dely + delz*delz;
+      radj = radius[j];
+      radsum = radi + radj;
+	  vorovolj=voro_array_use[j][0];
+	  vp0j=4.0/3.0*MY_PI*pow(original_rad[j],3);
+	  //if (rsq >= radsum*radsum) {
+      if (sqrt(rsq) >= radsum) {
+
+        // unset non-touching neighbors
+
+        touch[jj] = 0;
+        shear = &allshear[23*jj];
+        shear[0] = 0.0;
+        shear[1] = 0.0;
+        shear[2] = 0.0;
+        shear[3] = 0.0;
+        shear[4] = 0.0;
+        shear[5] = 0.0;
+        shear[6] = 0.0;
+        shear[7] = 0.0;
+		shear[8]=0.0;
+        shear[9]=0.0;
+		shear[10]=0.0;
+		shear[11]=0.0;
+		shear[12] = 0.0;
+        shear[13] = 0.0;
+        shear[14] = 0.0;
+        shear[15] = 0.0;
+        shear[16] = 0.0;
+        shear[17] = 0.0;
+		shear[18]=0.0;
+        shear[19]=0.0;
+		shear[20]=0.0;
+        shear[21]=0.0;
+		shear[22]=0.0;
+      } else {
+        shear = &allshear[23*jj];
+		
+		//std::cout<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+       howmanyint++;
+		//std::cout<<"The shearupdate = "<<shearupdate<<std::endl;
+		r = sqrt(rsq);
+        rinv = 1.0/r;
+        rsqinv = 1.0/rsq;
+
+        // parmeters needed for plasticy calculations
+        polyhertz = sqrt((radsum-r)*radi*radj / radsum);
+        reff = radi*radj / radsum;
+        delta = (radsum-r); //normal displacement between particle centers
+        deltay = cy*reff;  //delta value at yield
+        reffbar = shear[3];
+        deltamax = shear[4];
+        deltabar = shear[5];
+		Fmax=shear[6];
+		
+		oldfxx=shear[12];
+		oldfyy=shear[13];
+		oldfzz=shear[14];
+		oldxi=shear[15];
+		oldyi=shear[16];
+		oldzi=shear[17];
+		oldxj=shear[18];
+		oldyj=shear[19];
+		oldzj=shear[20];
+		
+		aretheymovingxi=((oldxi-x[i][0])*(oldxi-x[i][0])+(oldyi-x[i][1])*(oldyi-x[i][1])+(oldzi-x[i][2])*(oldzi-x[i][2]));
+		aretheymovingxj=((oldxj-x[j][0])*(oldxj-x[j][0])+(oldyj-x[j][1])*(oldyj-x[j][1])+(oldzj-x[j][2])*(oldzj-x[j][2]));
+		moving_deltaij=std::abs(aretheymovingxi-aretheymovingxj);
+		
+		
+		W1=oldfxx*(oldxi-x[i][0])+oldfyy*(oldyi-x[i][1])+oldfzz*(oldzi-x[i][2]);
+		W2=-oldfxx*(oldxj-x[j][0])-oldfyy*(oldyj-x[j][1])-oldfzz*(oldzj-x[j][2]);
+		W=W1+W2;
+		Wl=W;
+		Wu=W;
+		
+		
+		
+
+		
+		
+		
+		//Devanjith's calculation of contact area
+		cur_radi=old_radius[i];cur_radj=old_radius[j];
+		cur_radi=radius[i];cur_radj=radius[j];
+		vorov_ave_ratio=(vorovoli+vorovolj)/(vp0i+vp0j);
+		
+		if (itype==2 || itype==3){
+			vorov_ave_ratio=(vorovolj)/(vp0j);
+		}
+		if(jtype==2 || jtype==3){
+			vorov_ave_ratio=(vorovoli)/vp0i;
+		}
+		
+		b=cur_radj+cur_radi;
+		b=sqrt(rsq);
+	  
+		s=(b+cur_radj+cur_radi)*0.5;
+		A=sqrt(s*(s-cur_radi)*(s-cur_radj)*(s-b));
+		h=2.0*A/b;
+		if(isnan(h)==1){
+		 std::cout<<std::fixed<<std::setprecision(15)<<" "<<tag[i]<< " "<<tag[j]<<" "<<"h is complex "<<h<<" b "<< b <<" s "<<s<< " A "<< A<< " s-cur_radi "<<s-cur_radi<<" s-cur_radj "<<s-cur_radj<< " s-b "<<s-b<<" curradi "<<cur_radi<< " curradj "<< cur_radj<< " radsum "<<radsum<< " rsq "<<rsq<< " radsum*radsum "<<radsum*radsum<<std::endl;
+		}
+		
+		//just added by Dev to calculate the stress tensor.
+		temp_h=(cur_radi*cur_radi-h*h)/(cur_radj*cur_radj-h*h);
+		temp_r2=b/(1.0+sqrt(temp_h));
+		temp_r1=b-temp_r2;
+		
+		tempr1x=delx*temp_r1/b*-1;
+		tempr1y=dely*temp_r1/b*-1;
+		tempr1z=delz*temp_r1/b*-1;
+		tempr2x=delx*temp_r2/b;
+		tempr2y=dely*temp_r2/b;
+		tempr2z=delz*temp_r2/b;
+		
+	/* 	temp_h=(cur_radi*cur_radi-h*h)/(cur_radj*cur_radj-h*h);
+		//temp_r1=sqrt(cur_radj*cur_radj*temp_h);
+		
+		//temp_r2=b-temp_r1;
+		temp_r2=b/(1.0+sqrt(temp_h));//temp_r2 is little r2 for the neighboring granule
+		temp_r1=b-temp_r2; //temp_r1 is what we want!
+		cur_radi_n=radius[i];
+		cur_radj_n=radius[j]; */
+/* 		contact_rad=sqrt(cur_radi*cur_radi-temp_r1*temp_r1);
+		contact_rad_ni=sqrt(cur_radi_n*cur_radi_n-temp_r1*temp_r1);
+		contact_rad_nj=sqrt(cur_radj_n*cur_radj_n-temp_r2*temp_r2);
+		contact_area=MY_PI*contact_rad*contact_rad;
+		contact_area_ni=MY_PI*contact_rad_ni*contact_rad_ni;
+		contact_area_nj=MY_PI*contact_rad_nj*contact_rad_nj;
+		std::cout<<' '<<i<<' '<< j <<' '<< b<<' '<<h<<' '<<A<<' ' <<temp_h<<' '<<cur_radi<<' '<<cur_radi_n<<' '<< cur_radj<<' '<<cur_radj_n<<' '<<temp_r1<<' '<< temp_r2 << ' '<< contact_rad<<' '<<contact_area<<' '<<std::endl;
+		std::cout<<' '<<i<<' '<< j <<' '<<contact_rad<<' '<<contact_rad_ni<<' '<<contact_rad_nj<<' '<<contact_area<<' '<<contact_area_ni<<' '<<contact_area_nj<<' '<<' '<<std::endl;
+
+ */
+        // relative translational velocity
+		
+		contact_area=MY_PI*h*h;
+
+        vr1 = v[i][0] - v[j][0];
+        vr2 = v[i][1] - v[j][1];
+        vr3 = v[i][2] - v[j][2];
+
+        // normal component
+
+        vnnr = vr1*delx + vr2*dely + vr3*delz;
+        vn1 = delx*vnnr * rsqinv;
+        vn2 = dely*vnnr * rsqinv;
+        vn3 = delz*vnnr * rsqinv;
+
+        // tangential component
+
+        vt1 = vr1 - vn1;
+        vt2 = vr2 - vn2;
+        vt3 = vr3 - vn3;
+
+        // relative rotational velocity
+
+        wr1 = (radi*omega[i][0] + radj*omega[j][0]) * rinv;
+        wr2 = (radi*omega[i][1] + radj*omega[j][1]) * rinv;
+        wr3 = (radi*omega[i][2] + radj*omega[j][2]) * rinv;
+
+	// meff = effective mass of pair of particles
+        // if I or J part of rigid body, use body mass
+        // if I or J is frozen, meff is other particle
+
+        if (rmass) {
+          mi = rmass[i];
+          mj = rmass[j];
+        } else {
+          mi = mass[type[i]];
+          mj = mass[type[j]];
+        }
+        if (fix_rigid) {
+          if (mass_rigid[i] > 0.0) mi = mass_rigid[i];
+          if (mass_rigid[j] > 0.0) mj = mass_rigid[j];
+        }
+
+        meff = mi*mj / (mi+mj);
+        if (mask[i] & freeze_group_bit) meff = mj;
+        if (mask[j] & freeze_group_bit) meff = mi;
+
+        // relative velocities
+
+        vtr1 = vt1 - (delz*wr2-dely*wr3);
+        vtr2 = vt2 - (delx*wr3-delz*wr1);
+        vtr3 = vt3 - (dely*wr1-delx*wr2);
+        vrel = vtr1*vtr1 + vtr2*vtr2 + vtr3*vtr3;
+        vrel = sqrt(vrel);
+
+        // normal force = Hertzian contact + normal velocity damping + plastic deformation
+		
+		//Isaiah's force calculation
+
+ /*        damp = meff*gamman*vnnr*rsqinv;
+        if (delta >= deltamax) { // pure elastic contact, add "&& vrel > 0" for loading
+          deltamax = delta; //maximum delta during contact
+          if (delta <= deltay) {
+            ccel = polyhertz*(kn*delta*rinv-damp);
+
+	    // Added by Isaiah to calculate strain energy during loading in elastsic regime
+	    energy_strain_neigh = r*2/5*ccel*delta;
+          } else { // mixed elastic plastic, add "&& vrel > 0" for loading
+            deltap = cp*reff; //delta value at pure plastic flow
+            caradp = sqrt(2*reff*deltap); //contact area at yield
+            phi1 = 1/cosh((1+weight)*(delta-deltay)/(deltap-deltay)); //contribution to elastic deformation
+            phi2 = 1 - 1/cosh((1-weight)*(delta-deltay)/(deltap-deltay)); //contribution to plastic deformation
+            carad = sqrt(reff*delta*(1+phi2));
+            ccel = phi1*polyhertz*(kn*delta*rinv-damp) + phi2*knp*rinv*pow(carad,n)/pow(caradp,(n-2));
+            deltabar = delta*(1-ccel*r/(kn*polyhertz*delta)); //unrecoverable delta
+            reffbar = ccel*ccel*r*r/(kn*kn*pow((deltamax-deltabar),3)); //unrecoverable reff
+
+	    // Added by Isaiah to calculate strain energy during loading in plastic regime
+	    energy_strain_neigh = r*2/5*sqrt(reffbar*(delta-deltabar))*(kn*(delta-deltabar)*rinv-damp)*(delta-deltabar);
+
+            // Added by Isaiah to calculate energy by plasticity (using Simpson's Rule for integration during loading)
+	    plastic_calc_energy_loading = 0.0;
+	    plastic_calc_n = 100;
+	    for (int plastic_calc_i = 0; plastic_calc_i <= plastic_calc_n; plastic_calc_i++) {
+		plastic_calc_delta = deltay+(delta-deltay)/plastic_calc_n*plastic_calc_i;
+		plastic_calc_polyhertz = sqrt(plastic_calc_delta*radi*radj / radsum);
+		plastic_calc_phi1 = 1/cosh((1+weight)*(plastic_calc_delta-deltay)/(deltap-deltay));
+		plastic_calc_phi2 = 1 - 1/cosh((1-weight)*(plastic_calc_delta-deltay)/(deltap-deltay));
+                plastic_calc_carad = sqrt(reff*plastic_calc_delta*(1+plastic_calc_phi2));
+		plastic_calc_force = r*plastic_calc_phi1*plastic_calc_polyhertz*(kn*plastic_calc_delta*rinv-damp) + r*plastic_calc_phi2*knp*rinv*pow(plastic_calc_carad,n)/pow(caradp,(n-2));
+                if (plastic_calc_i == 0 || plastic_calc_i == plastic_calc_n)
+		  plastic_calc_energy_loading += plastic_calc_force;
+		else if (plastic_calc_i % 2 != 0)
+		  plastic_calc_energy_loading += 4 * plastic_calc_force;
+		else
+		  plastic_calc_energy_loading += 2 * plastic_calc_force;
+	    }
+	    plastic_calc_energy_loading = plastic_calc_energy_loading*((delta-deltay)/plastic_calc_n)/3;
+
+
+            // Added by Isaiah to calculate energy by plasticity (using numerical integration during loading)
+//            plastic_calc_energy_loading = 0.0;
+//            plastic_calc_n = 100;
+//            for (int plastic_calc_i = 0; plastic_calc_i < plastic_calc_n; plastic_calc_i++) {
+//                plastic_calc_delta = deltay+(delta-deltay)/plastic_calc_n*(plastic_calc_i+0.5);
+//                plastic_calc_polyhertz = sqrt(plastic_calc_delta*radi*radj / radsum);
+//                plastic_calc_phi1 = 1/cosh((1+weight)*(plastic_calc_delta-deltay)/(deltap-deltay));
+//                plastic_calc_phi2 = 1 - 1/cosh((1-weight)*(plastic_calc_delta-deltay)/(deltap-deltay));
+//                plastic_calc_carad = sqrt(reff*plastic_calc_delta*(1+plastic_calc_phi2));
+//                plastic_calc_force = r*plastic_calc_phi1*plastic_calc_polyhertz*(kn*plastic_calc_delta*rinv-damp) + r*plastic_calc_phi2*knp*rinv*pow(plastic_calc_carad,n)/pow(caradp,(n-2));
+//                plastic_calc_energy_loading += plastic_calc_force;
+//            }
+//            plastic_calc_energy_loading = plastic_calc_energy_loading*(delta-deltay)/plastic_calc_n;
+
+	    energy_plastic_neigh = r*2/5*sqrt(deltay*radi*radj/radsum)*(kn*deltay*rinv-damp)*deltay + plastic_calc_energy_loading - energy_strain_neigh;
+            energy_plastic[i] += (energy_plastic_neigh - shear[6]);
+            shear[6] = energy_plastic_neigh;
+          }
+        } else if (deltamax <= deltay) {
+          ccel = polyhertz*(kn*delta*rinv-damp);
+
+	  // Added by Isaiah to calculate strain energy during unloading from maximum loading in elastic regime or reloading in elastic regime
+	  energy_strain_neigh = r*2/5*ccel*delta;
+        } else if (delta>deltabar) {
+          ccel = sqrt(reffbar*(delta-deltabar))*(kn*(delta-deltabar)*rinv-damp);
+
+	  // Added by Isaiah to calculate strain energy during unloading from maximum loading in plastic regime or reloading in plastic regime
+	  energy_strain_neigh = r*2/5*ccel*(delta-deltabar);
+        } else {
+          ccel = 0;
+
+	  // Added by Isaiah to calculate strain energy in all other cases
+	  energy_strain_neigh = 0;
+        }
+
+	// Added by Isaiah to calculate strain energy
+	energy_strain[i] += energy_strain_neigh; */
+	
+	    //ccel will denote the force
+		cur_pressure=pressure_fn(vorov_ave_ratio);
+		ccel=cur_pressure*contact_area;
+		//std::cout<<tag[i]<<' '<<tag[j]<<' '<<ccel<<' '<<cur_pressure<<' '<<h<<' '<<contact_area<<' '<<vorov_ave_ratio<<' '<<vorovoli<<' '<<vp0i<<' '<<vorovolj<<' '<<vp0j<<std::endl;
+
+		ccel=ccel*rinv;
+		
+		
+/* 		curdx=delta;
+		olddx=shear[8];
+		deldx=std::abs(curdx-olddx);
+		oldfx=shear[9];
+		curfx=cur_F;
+		energy_plastic_loading=shear[10]; */
+		
+		double isactive;
+		if (shearupdate==1){
+		if (delta>=deltamax ){
+			isactive=1;
+			deltamax=delta;
+			cur_pressure=pressure_fn(vorov_ave_ratio);
+			ccel=cur_pressure*contact_area;
+			cur_F=ccel;
+			Fmax=ccel;
+			ccel=ccel*rinv;
+			deltabar=0.95*deltamax;
+			curdx=delta;
+			olddx=shear[8];
+			deldx=std::abs(curdx-olddx);
+			oldfx=shear[9];
+			curfx=cur_F;
+			energy_plastic_loading=shear[10];
+			
+			
+			
+			//energy_strain[i]=Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8);
+			energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8);
+			energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8;
+			
+			max_energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8;
+			
+			energy_plastic_loading+=deldx*(oldfx+curfx)*0.5;
+			//tempenergy=energy_plastic_loading-energy_strain[i];
+			energy_plastic_neigh=energy_plastic_loading-energy_strain_neigh;
+			
+			//energy_plastic[i]+=(tempenergy-shear[11]);
+			//energy_plastic[i]+=(energy_plastic_neigh-shear[7]);
+
+			//////energy_plastic[i]+=((energy_plastic_neigh-shear[7])); delete this for the original
+			
+			energy_plastic[i]+=W/2.0;
+			energy_plastic[j]+=W/2.0;
+		
+			tot_es_max=Fmax*(deltamax-deltabar)/2.8;
+			
+			//if(itype==1
+			tot_es=tot_es_max;
+			energy_strain[i]+=tot_es_max/2.0;
+			energy_strain[j]+=tot_es_max/2.0;	
+			
+			
+			shear[7]=energy_plastic_neigh;
+			shear[21]+=W;
+/* 			tot_ep=shear[21]-tot_es_max;
+			loading_work[i]+=tot_ep/2;
+			loading_work[j]+=tot_ep/2; */
+			
+/* 			if(shearupdate==0){
+				shear[7]
+				
+			} */
+			
+			//energy_plastic[i]+=((energy_plastic_neigh-shear[7]))/2;
+			//energy_plastic[j]+=((energy_plastic_neigh-shear[7]))/2;
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+			//energy_plastic[i]=energy_plastic[i]+deldx*(oldfx+curfx)*0.5-energy_strain[i];
+			//energy_plastic[i]=energy_plastic[i]+energy_plastic_loading-energy_strain[i]-shear[11];
+			//energy_plastic[i]=energy_plastic_loading-energy_strain[i];
+
+			
+			
+			
+		}else if(delta>=deltabar){
+			isactive=0;
+			ccel=Fmax*pow((delta-deltabar)/(deltamax-deltabar),1.8);
+			cur_F=ccel;
+			curfx=cur_F;
+			ccel=ccel*rinv;
+			max_energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8;
+
+			
+			//energy_strain[i]=Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8);
+			energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8);
+			energy_plastic_loading=shear[10];
+			/////energy_plastic[i]+=0.0; //////Delete this for the original
+
+			energy_plastic[i]+=W/2.0;
+			energy_plastic[j]+=W/2.0;
+			//energy_strain[i]+=W/2;
+			//energy_strain[i]+=W/2;
+			shear[22]+=W;
+			tot_es_max=Fmax*(deltamax-deltabar)/2.8;
+			tot_es=tot_es_max+shear[22];
+			tot_es=energy_strain_neigh;
+			energy_strain[i]+=tot_es/2.0;
+			energy_strain[j]+=tot_es/2.0;
+			
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+
+
+			
+		}else{
+			isactive=-1;
+			ccel=0.0;
+			cur_F=ccel;
+			curfx=cur_F;
+			
+			//energy_strain[i]=0;
+			energy_strain_neigh=0.0;
+			//////energy_plastic[i]+=0.0; delete this for the original;
+			
+			max_energy_strain_neigh=Fmax*(deltamax-deltabar)/2.8;
+			tot_es_max=max_energy_strain_neigh;
+			
+			energy_plastic[i]+=W/2.0;
+			energy_plastic[j]+=W/2.0;
+			energy_plastic_loading=shear[10];
+ 			tot_es=0;
+			energy_strain[i]+=tot_es/2;
+			energy_strain[j]+=tot_es/2; 
+			
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+
+			
+		}
+		tot_es_max=Fmax*(deltamax-deltabar)/2.8;
+		tot_ep=shear[21]-tot_es_max;
+/* 		loading_work[i]+=tot_ep/2.0;
+		loading_work[j]+=tot_ep/2.0; */
+		
+		if (itype==1 && jtype==1){
+			loading_work[i]+=W/2.0;
+			loading_work[j]+=W/2.0;			
+			voro_data[i]+=tot_ep/2.0;
+			voro_data[j]+=tot_ep/2.0;
+			
+		}
+		if (itype==1 && jtype==3){
+			loading_work[i]+=W;
+			voro_data[i]+=tot_ep;
+			
+		}
+		if (itype==3 && jtype==1){
+			loading_work[j]+=W;
+			voro_data[j]+=tot_ep;
+			
+		}		
+		if (itype==1 && jtype==3){
+			energy_straing[i]+=tot_es;
+			energy_plasticg[i]+=W;
+			
+		}
+		if (jtype==1 && itype==3){
+			energy_straing[j]+=tot_es;
+			energy_plasticg[j]+=W;
+			
+		}
+		if(itype ==1 && jtype ==1){
+			energy_straing[i]+=tot_es/2.0;
+			energy_straing[j]+=tot_es/2.0;
+			energy_plasticg[i]+=W/2.0;
+			energy_plasticg[j]+=W/2.0;
+		}
+		
+		
+		energy_max_strain[i]+=energy_strain_neigh/2.0;
+		energy_max_strain[j]+=energy_strain_neigh/2.0;
+		//energy_strain[i]+=energy_strain_neigh;
+
+		
+		
+		
+		
+		oldfx=curfx;
+		olddx=delta;
+		shear[8]=olddx;
+		shear[9]=oldfx;
+		shear[10]=energy_plastic_loading;
+		
+/* 		if (cur_time % remainder==0){
+		//what i had before
+		
+/* 		file<<tag[i]<<' '<<tag[j]<<' '<<x[i][0]<<' '<<x[i][1]<<' '<<x[i][2]<<' '<<x[j][0]<<' '<<x[j][1]<<' '<<x[j][2]<<' '<<cur_F<<' '<<cur_pressure<<' '<<h<<' '<<contact_area<<' '<<vorov_ave_ratio<<' '<<vorovoli<<' '<<vp0i<<' '<<vorovolj<<' '<<vp0j<<' '<<energy_plastic[i]<<' '<<energy_plastic[j]<<' '<<energy_strain[i]<<' '<<energy_strain[j]<<' '<<energy_strain_neigh<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<isactive<<' '<<delta<<' '<<deltamax<<std::endl;
+		file<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+ */		
+/*	
+		if(itype==1 && jtype ==1){
+			contact_number=(tag[i]+tag[j])/2;
+			file<<"nowall"<< ' '<<contact_number<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+		}
+		if(itype==1 && jtype ==3){
+			contact_number=(tag[i]+tag[j])/2;
+			file<<"nowall"<< ' '<<contact_number<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+		}
+		if(itype==3 && jtype ==1){
+			contact_number=(tag[i]+tag[j])/2;
+			file<<"nowall"<< ' '<<contact_number<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+		}
+		if(itype==1 && jtype ==2){
+			contact_number=(tag[i]);
+			file<<"wall"<< ' '<<contact_number<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+		}
+		if(itype==2 && jtype ==1){
+			contact_number=(tag[j]);
+			file<<"wall"<< ' '<<contact_number<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+		}
+		} */
+		
+		
+		
+		if(isnan(energy_plastic[i])==1){
+		 std::cout<<std::fixed<<std::setprecision(15)<<" "<<tag[i]<< " "<<tag[j]<<" "<<"epi is complex "<<energy_plastic[i]<<"epi is complex "<<energy_plastic[j]<<" deldx "<<deldx<<" olddx "<<olddx<< " energyplasticloading "<< energy_plastic_loading<<" energy_plastic_neigh "<<energy_plastic_neigh<<" energy_strain_neigh "<<energy_strain_neigh << " isactive "<<isactive<< " first term "<< Fmax*(deltamax-deltabar)/2.8 << " second term "<< pow(((delta-deltabar)/(deltamax-deltabar)),2.8) << " combined " << Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8) << " delta max " <<deltamax<< " delta bar " <<deltabar<< " deltamax-deltabar "<<deltamax-deltabar<< " delta - deltabar "<<delta-deltabar<<" Fmax "<<Fmax<<std::endl;
+		}
+		if(isnan(energy_plastic[j])==1){
+		 std::cout<<std::fixed<<std::setprecision(15)<<" "<<tag[i]<< " "<<tag[j]<<" "<<"epi is complex "<<energy_plastic[i]<<"epi is complex "<<energy_plastic[j]<<" deldx "<<deldx<<" olddx "<<olddx<< " energyplasticloading "<< energy_plastic_loading<<" energy_plastic_neigh "<<energy_plastic_neigh<<" energy_strain_neigh "<<energy_strain_neigh << " isactive "<<isactive<< " first term "<< Fmax*(deltamax-deltabar)/2.8 << " second term "<< pow(((delta-deltabar)/(deltamax-deltabar)),2.8) << " combined " << Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8) << " delta max " <<deltamax<< " delta bar " <<deltabar<< " deltamax-deltabar "<<deltamax-deltabar<< " delta - deltabar "<<delta-deltabar<<" Fmax "<<Fmax<<std::endl;
+		}		
+		
+		}
+		
+		
+		
+
+		
+		
+		/////////dummy loop only for shearupdate==0
+		if (shearupdate==0){
+		if (delta>=deltamax ){
+			isactive=1;
+			deltamax=delta;
+			cur_pressure=pressure_fn(vorov_ave_ratio);
+			ccel=cur_pressure*contact_area;
+			cur_F=ccel;
+			Fmax=ccel;
+			ccel=ccel*rinv;
+			deltabar=0.95*deltamax;
+			energy_plastic[i]+=0.0;
+			energy_strain[i]+=0.0;
+			
+			//energy_plastic[i]+=((energy_plastic_neigh-shear[7]))/2;
+			//energy_plastic[j]+=((energy_plastic_neigh-shear[7]))/2;
+			//energy_plastic[i]=energy_plastic[i]+deldx*(oldfx+curfx)*0.5-energy_strain[i];
+			//energy_plastic[i]=energy_plastic[i]+energy_plastic_loading-energy_strain[i]-shear[11];
+			//energy_plastic[i]=energy_plastic_loading-energy_strain[i];
+
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+
+			
+			
+		}else if(delta>=deltabar){
+			isactive=0;
+			ccel=Fmax*pow((delta-deltabar)/(deltamax-deltabar),1.8);
+			cur_F=ccel;
+			ccel=ccel*rinv;
+			energy_plastic[i]+=0.0;
+			energy_strain[i]+=0.0;
+			//energy_strain[i]=Fmax*(deltamax-deltabar)/2.8*pow(((delta-deltabar)/(deltamax-deltabar)),2.8);
+
+			
+
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+
+			
+		}else{
+			isactive=-1;
+			ccel=0.0;
+			cur_F=ccel;
+			energy_strain[i]=0.0;
+			energy_plastic[i]+=0.0;
+
+			//std::cout<<' '<<i<<' '<<j<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[10]<<' '<<energy_plastic[i]<<' '<<shear[7]<<' '<<isactive<<' '<<delta<<' '<<deltamax<<' '<<deltabar<<std::endl;
+
+			
+		}
+				
+		
+		
+		}
+		/////////dummy loop only for shearupdate==0
+
+		//std::cout<<"after shearupdate "<<std::endl;
+
+
+
+        // shear history effects
+
+        touch[jj] = 1;
+        shear = &allshear[23*jj]; //change here devanjith
+        if (shearupdate) {
+          shear[0] += vtr1*dt;
+          shear[1] += vtr2*dt;
+          shear[2] += vtr3*dt;
+          shear[3] = reffbar;
+          shear[4] = deltamax;
+          shear[5] = deltabar;
+		  shear[6]=Fmax;
+		  //shear[7]=energy_plastic_neigh;
+		  //shear[7]=ccel/rinv;
+		  shear[8]=olddx;
+		  shear[9]=oldfx;
+		  shear[10]=energy_plastic_loading;
+		  
+		  
+		  //shear[11]=energy_plastic_neigh;
+        }
+		//std::cout<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+
+        shrmag = sqrt(shear[0]*shear[0] + shear[1]*shear[1] +
+                      shear[2]*shear[2]);
+
+        // rotate shear displacements
+
+        rsht = shear[0]*delx + shear[1]*dely + shear[2]*delz;
+        rsht *= rsqinv;
+        if (shearupdate) {
+          shear[0] -= rsht*delx;
+          shear[1] -= rsht*dely;
+          shear[2] -= rsht*delz;
+        }
+
+        // tangential forces = shear + tangential velocity damping
+
+        fs1 = -polyhertz * (kt*shear[0] + meff*gammat*vtr1);
+        fs2 = -polyhertz * (kt*shear[1] + meff*gammat*vtr2);
+        fs3 = -polyhertz * (kt*shear[2] + meff*gammat*vtr3);
+/*         double oldfs1=shear[8];
+ 	double oldfs2=shear[9];
+	double oldfs3=shear[10]; */
+
+        // rescale frictional displacements and forces if needed
+
+        fs = sqrt(fs1*fs1 + fs2*fs2 + fs3*fs3);
+        fn = xmu * fabs(ccel*r);
+
+        if (fs > fn) {
+          if (shrmag != 0.0) {
+            shear[0] = (fn/fs) * (shear[0] + meff*gammat*vtr1/kt) -
+              meff*gammat*vtr1/kt;
+            shear[1] = (fn/fs) * (shear[1] + meff*gammat*vtr2/kt) -
+              meff*gammat*vtr2/kt;
+            shear[2] = (fn/fs) * (shear[2] + meff*gammat*vtr3/kt) -
+              meff*gammat*vtr3/kt;
+            fs1 *= fn/fs;
+            fs2 *= fn/fs;
+            fs3 *= fn/fs;
+          } else fs1 = fs2 = fs3 = 0.0;
+        }
+
+        // forces & torques
+
+	// Added by Isaiah to correct a sign for the frictional force; the original code didn't specify vector
+        if (vtr1 != 0)
+                fs1 *= 1;//vtr1/sqrt(vtr1*vtr1);
+        if (vtr2 != 0)
+                fs2 *= 1;//vtr2/sqrt(vtr2*vtr2);
+        if (vtr3 != 0)
+                fs3 *= 1;//vtr3/sqrt(vtr3*vtr3);
+
+        fx = delx*ccel + fs1;
+        fy = dely*ccel + fs2;
+        fz = delz*ccel + fs3;
+		
+		fs_mag=sqrt(fs1*fs1+fs2*fs2+fs3*fs3);
+		
+
+		f[i][0] += fx;
+        f[i][1] += fy;
+        f[i][2] += fz;
+
+        tor1 = rinv * (dely*fs3 - delz*fs2);
+        tor2 = rinv * (delz*fs1 - delx*fs3);
+        tor3 = rinv * (delx*fs2 - dely*fs1);
+        torque[i][0] -= radi*tor1;
+        torque[i][1] -= radi*tor2;
+        torque[i][2] -= radi*tor3;
+
+        if (j < nlocal) {
+          f[j][0] -= fx;
+          f[j][1] -= fy;
+          f[j][2] -= fz;
+
+		  torque[j][0] -= radj*tor1;
+          torque[j][1] -= radj*tor2;
+          torque[j][2] -= radj*tor3;
+        }
+
+        if (evflag) ev_tally_xyz(i,j,nlocal,0,
+                                 0.0,0.0,fx,fy,fz,delx,dely,delz);
+
+        // Added by Isaiah to calculate energy dissipation by frcition
+		energy_friction[i] -= (fs1*vtr1 + fs2*vtr2 + fs3*vtr3) * dt; //might be wrong!!
+	//energy_friction[i]-=((fs1-oldfs1)/2*vtr1 + (fs2-oldfs2)/2*vtr2 + (fs3-oldfs3)/2*vtr3) * dt;
+        //energy_friction[i] += sqrt(pow(fs1*(vtr1*dt),2) + pow(fs2*(vtr2*dt),2) + pow(fs3*(vtr3*dt),2));
+        //energy_friction[i] += sqrt(pow((vtr1*dt),2) + pow((vtr2*dt),2) + pow((vtr3*dt),2))*sqrt(pow(fs1,2) + pow(fs2,2) + pow(fs3,2));
+
+
+        // Added by Isaiah
+        contact_j_new[contact_n] = atom->tag[j];
+        contact_delta_new[contact_n] = delta;
+        contact_force_new[contact_n*3] = fx;
+        contact_force_new[contact_n*3+1] = fy;
+        contact_force_new[contact_n*3+2] = fz;
+        contact_n++;
+		
+		if (shearupdate) {
+          
+		  shear[12]=delx*ccel;fx;
+		  shear[13]=dely*ccel;fy;
+		  shear[14]=delz*ccel;fz;
+		  shear[15]=x[i][0];
+		  shear[16]=x[i][1];
+		  shear[17]=x[i][2];
+		  shear[18]=x[j][0];
+		  shear[19]=x[j][1];
+		  shear[20]=x[j][2];
+		  
+		  
+		  //shear[11]=energy_plastic_neigh;
+        }
+		
+		if (cur_time % remainder==0){
+		//what i had before
+		
+/* 		file<<tag[i]<<' '<<tag[j]<<' '<<x[i][0]<<' '<<x[i][1]<<' '<<x[i][2]<<' '<<x[j][0]<<' '<<x[j][1]<<' '<<x[j][2]<<' '<<cur_F<<' '<<cur_pressure<<' '<<h<<' '<<contact_area<<' '<<vorov_ave_ratio<<' '<<vorovoli<<' '<<vp0i<<' '<<vorovolj<<' '<<vp0j<<' '<<energy_plastic[i]<<' '<<energy_plastic[j]<<' '<<energy_strain[i]<<' '<<energy_strain[j]<<' '<<energy_strain_neigh<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<isactive<<' '<<delta<<' '<<deltamax<<std::endl;
+		file<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+ */		
+		if(itype==1 && jtype ==1){
+			contact_number=(tag[i]*1.0+tag[j]*1.0)/2.0;
+			file<<"nowall"<< " "<<contact_number<<" shear0 "<<shear[0]<<" shear1 "<<shear[1]<<" shear2 "<<shear[2]<<"  shear3 "<<shear[3]<<"  shear4 "<<shear[4]<<"  shear5 "<<shear[5]<<"  shear6 "<<shear[6]<<"  shear7 "<<shear[7]<<"  shear8 "<<shear[8]<<"  shear9 "<<shear[9]<<"  shear10 "<<shear[10]<<"  shear11 "<<shear[11]<<"  currf "<<cur_F<<"  shear12 "<<shear[12]<<"  shear13 "<<shear[13]<<"  shear14 "<<shear[14]<<" shear15 "<<shear[15]<<" shear16 "<<shear[16]<<"  shear17 "<<shear[17]<<"  shear18 "<<shear[18]<<"  shear19 "<<shear[19]<<"  shear20 "<<shear[20]<<"  shear21 "<<shear[21]<<"  shear22 "<<shear[22]<<" fs mag "<<fs_mag<<" fs 1 "<<fs1<<" fs 2 "<<fs2<<" fs 3 "<<fs3<< std::endl;
+		}
+		if(itype==1 && jtype ==3){
+			contact_number=(tag[i]*1.0+tag[i]*1.0)/2.0;
+			file<<"nowall"<< " "<<contact_number<<" shear0 "<<shear[0]<<" shear1 "<<shear[1]<<" shear2 "<<shear[2]<<"  shear3 "<<shear[3]<<"  shear4 "<<shear[4]<<"  shear5 "<<shear[5]<<"  shear6 "<<shear[6]<<"  shear7 "<<shear[7]<<"  shear8 "<<shear[8]<<"  shear9 "<<shear[9]<<"  shear10 "<<shear[10]<<"  shear11 "<<shear[11]<<"  currf "<<cur_F<<"  shear12 "<<shear[12]<<"  shear13 "<<shear[13]<<"  shear14 "<<shear[14]<<" shear15 "<<shear[15]<<" shear16 "<<shear[16]<<"  shear17 "<<shear[17]<<"  shear18 "<<shear[18]<<"  shear19 "<<shear[19]<<"  shear20 "<<shear[20]<<"  shear21 "<<shear[21]<<"  shear22 "<<shear[22]<<" fs mag "<<fs_mag<<" fs 1 "<<fs1<<" fs 2 "<<fs2<<" fs 3 "<<fs3<< std::endl;
+		}
+		if(itype==3 && jtype ==1){
+			contact_number=(tag[j]*1.0+tag[j]*1.0)/2.0;
+			file<<"nowall"<< " "<<contact_number<<" shear0 "<<shear[0]<<" shear1 "<<shear[1]<<" shear2 "<<shear[2]<<"  shear3 "<<shear[3]<<"  shear4 "<<shear[4]<<"  shear5 "<<shear[5]<<"  shear6 "<<shear[6]<<"  shear7 "<<shear[7]<<"  shear8 "<<shear[8]<<"  shear9 "<<shear[9]<<"  shear10 "<<shear[10]<<"  shear11 "<<shear[11]<<"  currf "<<cur_F<<"  shear12 "<<shear[12]<<"  shear13 "<<shear[13]<<"  shear14 "<<shear[14]<<" shear15 "<<shear[15]<<" shear16 "<<shear[16]<<"  shear17 "<<shear[17]<<"  shear18 "<<shear[18]<<"  shear19 "<<shear[19]<<"  shear20 "<<shear[20]<<"  shear21 "<<shear[21]<<"  shear22 "<<shear[22]<<" fs mag "<<fs_mag<<" fs 1 "<<fs1<<" fs 2 "<<fs2<<" fs 3 "<<fs3<< std::endl;
+		}
+		if(itype==1 && jtype ==2){
+			contact_number=(tag[i]*1.0);
+			file<<"wall"<< " "<<contact_number<<" shear0 "<<shear[0]<<" shear1 "<<shear[1]<<" shear2 "<<shear[2]<<"  shear3 "<<shear[3]<<"  shear4 "<<shear[4]<<"  shear5 "<<shear[5]<<"  shear6 "<<shear[6]<<"  shear7 "<<shear[7]<<"  shear8 "<<shear[8]<<"  shear9 "<<shear[9]<<"  shear10 "<<shear[10]<<"  shear11 "<<shear[11]<<"  currf "<<cur_F<<"  shear12 "<<shear[12]<<"  shear13 "<<shear[13]<<"  shear14 "<<shear[14]<<" shear15 "<<shear[15]<<" shear16 "<<shear[16]<<"  shear17 "<<shear[17]<<"  shear18 "<<shear[18]<<"  shear19 "<<shear[19]<<"  shear20 "<<shear[20]<<"  shear21 "<<shear[21]<<"  shear22 "<<shear[22]<<" fs mag "<<fs_mag<<" fs 1 "<<fs1<<" fs 2 "<<fs2<<" fs 3 "<<fs3<< std::endl;
+		}
+		if(itype==2 && jtype ==1){
+			contact_number=(tag[j]);
+			file<<"wall"<< " "<<contact_number<<" shear0 "<<shear[0]<<" shear1 "<<shear[1]<<" shear2 "<<shear[2]<<"  shear3 "<<shear[3]<<"  shear4 "<<shear[4]<<"  shear5 "<<shear[5]<<"  shear6 "<<shear[6]<<"  shear7 "<<shear[7]<<"  shear8 "<<shear[8]<<"  shear9 "<<shear[9]<<"  shear10 "<<shear[10]<<"  shear11 "<<shear[11]<<"  currf "<<cur_F<<"  shear12 "<<shear[12]<<"  shear13 "<<shear[13]<<"  shear14 "<<shear[14]<<" shear15 "<<shear[15]<<" shear16 "<<shear[16]<<"  shear17 "<<shear[17]<<"  shear18 "<<shear[18]<<"  shear19 "<<shear[19]<<"  shear20 "<<shear[20]<<"  shear21 "<<shear[21]<<"  shear22 "<<shear[22]<<" fs mag "<<fs_mag<<" fs 1 "<<fs1<<" fs 2 "<<fs2<<" fs 3 "<<fs3<< std::endl;
+		}
+		}
+		
+		//Writing to the second file to store terms for the stress tensor.
+		
+		if (cur_time % remainder==0){
+		//what i had before
+		
+/* 		file<<tag[i]<<' '<<tag[j]<<' '<<x[i][0]<<' '<<x[i][1]<<' '<<x[i][2]<<' '<<x[j][0]<<' '<<x[j][1]<<' '<<x[j][2]<<' '<<cur_F<<' '<<cur_pressure<<' '<<h<<' '<<contact_area<<' '<<vorov_ave_ratio<<' '<<vorovoli<<' '<<vp0i<<' '<<vorovolj<<' '<<vp0j<<' '<<energy_plastic[i]<<' '<<energy_plastic[j]<<' '<<energy_strain[i]<<' '<<energy_strain[j]<<' '<<energy_strain_neigh<<' '<<energy_plastic_loading<<' '<<energy_plastic_neigh<<' '<<isactive<<' '<<delta<<' '<<deltamax<<std::endl;
+		file<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+ */		
+		if(itype==1 && jtype ==1){
+			contact_number=(tag[i]*1.0+tag[j]*1.0)/2.0;
+
+				file2<< " num i " <<tag[i]<<" num j "<< tag[j]<< " force x " << fx << " force y " << fy << " force z " << fz << " rx " <<tempr1x<< " ry " <<tempr1y<< " rz " <<tempr1z<<std::endl;
+				file2<< " num i " <<tag[j]<<" num j "<< tag[i]<< " force x " << -fx << " force y " << -fy << " force z " << -fz << " rx " <<tempr2x<< " ry " <<tempr2y<< " rz " <<tempr2z<<std::endl;
+
+		
+		}
+		if(itype==1 && jtype ==3){
+			contact_number=(tag[i]*1.0+tag[i]*1.0)/2.0;
+
+				file2<< " num i " <<tag[i]<<" num j "<< tag[j]<< " force x " << fx << " force y " << fy << " force z " << fz << " rx " <<tempr1x<< " ry " <<tempr1y<< " rz " <<tempr1z<<std::endl;
+				file2<< " num i " <<tag[j]<<" num j "<< tag[i]<< " force x " << -fx << " force y " << -fy << " force z " << -fz << " rx " <<tempr2x<< " ry " <<tempr2y<< " rz " <<tempr2z<<std::endl;
+		}
+		if(itype==3 && jtype ==1){
+			contact_number=(tag[j]*1.0+tag[j]*1.0)/2.0;
+				file2<< " num i " <<tag[i]<<" num j "<< tag[j]<< " force x " << fx << " force y " << fy << " force z " << fz << " rx " <<tempr1x<< " ry " <<tempr1y<< " rz " <<tempr1z<<std::endl;
+				file2<< " num i " <<tag[j]<<" num j "<< tag[i]<< " force x " << -fx << " force y " << -fy << " force z " << -fz << " rx " <<tempr2x<< " ry " <<tempr2y<< " rz " <<tempr2z<<std::endl;
+		}
+		if(itype==1 && jtype ==2){
+			contact_number=(tag[i]*1.0);
+				file2<< " num i " <<tag[i]<<" num j "<< tag[j]<< " force x " << fx << " force y " << fy << " force z " << fz << " rx " <<tempr1x<< " ry " <<tempr1y<< " rz " <<tempr1z<<std::endl;
+				file2<< " num i " <<tag[j]<<" num j "<< tag[i]<< " force x " << -fx << " force y " << -fy << " force z " << -fz << " rx " <<tempr2x<< " ry " <<tempr2y<< " rz " <<tempr2z<<std::endl;
+		}
+		if(itype==2 && jtype ==1){
+			contact_number=(tag[j]);
+				file2<< " num i " <<tag[i]<<" num j "<< tag[j]<< " force x " << fx << " force y " << fy << " force z " << fz << " rx " <<tempr1x<< " ry " <<tempr1y<< " rz " <<tempr1z<<std::endl;
+				file2<< " num i " <<tag[j]<<" num j "<< tag[i]<< " force x " << -fx << " force y " << -fy << " force z " << -fz << " rx " <<tempr2x<< " ry " <<tempr2y<< " rz " <<tempr2z<<std::endl;
+		}
+		}
+
+/*         shear[8]=fs1;
+	shear[9]=fs2;
+	shear[10]=fs3; */
+
+      }
+    }
+
+    // Added by Isaiah to output contacted grain, delta and force
+/*     for (k = 0; k < 12; k++) {
+      contact_j[i][k] = contact_j_new[k];
+      contact_delta[i][k] = contact_delta_new[k];
+    }
+    for (k = 0; k < 36; k++)
+      contact_force[i][k] = contact_force_new[k]; */
+  }
+  
+  //std::cout<<"how many int "<<howmanyint<<std::endl;
+  
+    for (ii = 0; ii < inum; ii++) {
+	  old_radius[ii]=0;
+	  oldep[ii]=0;
+	  //std::cout<<"energy plastic "<<energy_plastic[ii]<<std::endl;
+    }
+    memory->destroy(old_radius);
+	memory->destroy(oldep);
+	
+	if (cur_time % remainder==0){
+		  
+		file.close();
+		file2.close();
+
+	}
+  
+  for(ii=0;ii<inum;ii++){
+	  i=ilist[ii];
+	  
+	  //std::cout<<' '<<i<<' '<<energy_plastic[i]<<std::endl;
+  }
+  
+/*     for (ii = 0; ii < inum; ii++) {
+    i = ilist[ii];
+    xtmp = x[i][0];
+    ytmp = x[i][1];
+    ztmp = x[i][2];
+    radi = radius[i];
+    touch = firsttouch[i];
+    allshear = firstshear[i];
+    jlist = firstneigh[i];
+    jnum = numneigh[i];
+	itype=type[i];
+
+    
+    for (jj = 0; jj < jnum; jj++) {
+      j = jlist[jj];
+      jt = j;
+      j &= NEIGHMASK;
+	  jtype=type[j];
+
+      delx = xtmp - x[j][0];
+      dely = ytmp - x[j][1];
+      delz = ztmp - x[j][2];
+      rsq = delx*delx + dely*dely + delz*delz;
+      radj = radius[j];
+      radsum = radi + radj;
+
+
+      if (rsq >= radsum*radsum) {
+
+        // unset non-touching neighbors
+
+        touch[jj] = 0;
+        shear = &allshear[12*jj];
+        shear[0] = 0.0;
+        shear[1] = 0.0;
+        shear[2] = 0.0;
+        shear[3] = 0.0;
+        shear[4] = 0.0;
+        shear[5] = 0.0;
+        shear[6] = 0.0;
+        shear[7] = 0.0;
+		shear[8]=0.0;
+        shear[9]=0.0;
+		shear[10]=0.0;
+		shear[11]=0.0;
+
+      } else {
+        shear = &allshear[12*jj];
+		
+		std::cout<<' '<<tag[i]<<' '<<tag[j]<<' '<<shear[0]<<' '<<shear[1]<<' '<<shear[2]<<' '<<shear[3]<<' '<<shear[4]<<' '<<shear[5]<<' '<<shear[6]<<' '<<shear[7]<<' '<<shear[8]<<' '<<shear[9]<<' '<<shear[10]<<' '<<shear[11]<<' '<<std::endl;
+	}
+	}
+	} */
+
+}
+
+double PairGranEPHistoryRCalc::pressure_fn(double V){
+    double beta=5.2;
+    double H=1.20e+9;
+    double nu=0.3;
+    double E=115.0e+9;
+    double k=E/(3.0*(1.0-2.0*nu));
+    
+	double v2norm=(1.0-beta*H/k);
+	double l,sv,y0,y1,x0,x1,l_vec;
+    
+    
+    y0=1.15e+9;
+    y1=1.7e+9;733200000.0;
+    x0=1.2;
+    x1=2.0;
+	sv=V;
+    H=y0+(y1-y0)*(1.0)/(1.0+exp(-20.0*(sv-(x0+x1)/2.0)));
+
+
+	l_vec=(1.0+(beta-1.0)*(exp(-k/((beta-1.0)*H)*(V-v2norm))))*H;
+    l=l_vec;
+    return l;
+}
+
+/* ----------------------------------------------------------------------
+   global settings
+------------------------------------------------------------------------- */
+
+void PairGranEPHistoryRCalc::settings(int narg, char **arg)
+{
+  if (narg != 11) error->all(FLERR,"Illegal pair_style command");
+
+  kn = force->numeric(FLERR,arg[0]);
+  if (strcmp(arg[1],"NULL") == 0) kt = kn * 2.0/7.0;
+  else kt = force->numeric(FLERR,arg[1]);
+
+  gamman = force->numeric(FLERR,arg[2]);
+  if (strcmp(arg[3],"NULL") == 0) gammat = 0.5 * gamman;
+  else gammat = force->numeric(FLERR,arg[3]);
+
+  xmu = force->numeric(FLERR,arg[4]);
+  dampflag = force->inumeric(FLERR,arg[5]);
+  if (dampflag == 0) gammat = 0.0;
+  
+  weight = force->numeric(FLERR,arg[6]);
+  cy = force->numeric(FLERR,arg[7]);
+  cp = force->numeric(FLERR,arg[8]);
+  p0 = force->numeric(FLERR,arg[9]);
+  knp = 3.1415926535897*p0;
+  n = force->numeric(FLERR,arg[10]);
+
+  if (kn < 0.0 || kt < 0.0 || gamman < 0.0 || gammat < 0.0 ||
+      xmu < 0.0 || xmu > 10000.0 || dampflag < 0 || dampflag > 1)
+    error->all(FLERR,"Illegal pair_style command");
+
+  // convert Kn and Kt from pressure units to force/distance^2
+
+  kn /= force->nktv2p;
+  kt /= force->nktv2p;
+  knp /= force->nktv2p;
+}
+
+/* ---------------------------------------------------------------------- */
+
+double PairGranEPHistoryRCalc::single(int i, int j, int itype, int jtype,
+                                    double rsq,
+                                    double factor_coul, double factor_lj,
+                                    double &fforce)
+{
+  double radi,radj,radsum;
+  double r,rinv,rsqinv,delx,dely,delz;
+  double vr1,vr2,vr3,vnnr,vn1,vn2,vn3,vt1,vt2,vt3,wr1,wr2,wr3;
+  double mi,mj,meff,damp,ccel,polyhertz;
+  double vtr1,vtr2,vtr3,vrel,shrmag,rsht;
+  double fs1,fs2,fs3,fs,fn;
+  double reff,delta,deltay,deltap,carad,carady,caradp,phi1,phi2, t1, t2, t3,t4,t41, t31,t32,t33, t34, coshp,coshn,sinhp,sinhn,pii,vrel1;
+  double deltamax,deltabar,reffbar;
+  double Fmax;
+
+  double *radius = atom->radius;
+  
+  radi = radius[i];
+  radj = radius[j];
+  radsum = radi + radj;
+  pii=3.1415926535897;
+  
+  
+  if (rsq >= radsum*radsum) {
+    fforce = 0.0;
+    svector[0] = svector[1] = svector[2] = 0;
+    svector[3] = rsq-radsum;
+    svector[4]=deltamax;
+    svector[5]=0;
+    svector[6]=0;
+	svector[7]=0;
+	svector[8]=0;
+    return 0.0;
+  }
+  
+  
+  
+  r = sqrt(rsq);
+  rinv = 1.0/r;
+  rsqinv = 1.0/rsq;
+
+  // parmeters needed for plasticy calculations
+  polyhertz = sqrt((radsum-r)*radi*radj / radsum);
+  reff = radi*radj / radsum;
+  delta = (radsum-r); //normal displacement between particle centers
+  deltay = cy*reff;  //delta value at yield
+  
+  
+
+	// double cur_radi,cur_radj,vorov_ave_ratio,vorovoli,vorovolj,b,s,A,h
+
+  // relative translational velocity
+
+  double **v = atom->v;
+  vr1 = v[i][0] - v[j][0];
+  vr2 = v[i][1] - v[j][1];
+  vr3 = v[i][2] - v[j][2];
+
+  // normal component
+
+  double **x = atom->x;
+  delx = x[i][0] - x[j][0];
+  dely = x[i][1] - x[j][1];
+  delz = x[i][2] - x[j][2];
+
+  vnnr = vr1*delx + vr2*dely + vr3*delz;
+  vn1 = delx*vnnr * rsqinv;
+  vn2 = dely*vnnr * rsqinv;
+  vn3 = delz*vnnr * rsqinv;
+
+  // tangential component
+
+  vt1 = vr1 - vn1;
+  vt2 = vr2 - vn2;
+  vt3 = vr3 - vn3;
+
+  // relative rotational velocity
+
+  double **omega = atom->omega;
+  wr1 = (radi*omega[i][0] + radj*omega[j][0]) * rinv;
+  wr2 = (radi*omega[i][1] + radj*omega[j][1]) * rinv;
+  wr3 = (radi*omega[i][2] + radj*omega[j][2]) * rinv;
+
+  // meff = effective mass of pair of particles
+  // if I or J part of rigid body, use body mass
+  // if I or J is frozen, meff is other particle
+
+  double *rmass = atom->rmass;
+  double *mass = atom->mass;
+  int *type = atom->type;
+  int *mask = atom->mask;
+
+  if (rmass) {
+    mi = rmass[i];
+    mj = rmass[j];
+  } else {
+    mi = mass[type[i]];
+    mj = mass[type[j]];
+  }
+  if (fix_rigid) {
+    // NOTE: insure mass_rigid is current for owned+ghost atoms?
+    if (mass_rigid[i] > 0.0) mi = mass_rigid[i];
+    if (mass_rigid[j] > 0.0) mj = mass_rigid[j];
+  }
+
+  meff = mi*mj / (mi+mj);
+  if (mask[i] & freeze_group_bit) meff = mj;
+  if (mask[j] & freeze_group_bit) meff = mi;
+  
+  int *jlist = list->firstneigh[i];
+  int jnum = list->numneigh[i];
+  int *touch = list->listgranhistory->firstneigh[i];
+  double *allshear = list->listgranhistory->firstdouble[i];
+  double *shear = &allshear[8*neighprev];
+
+  // relative velocities
+
+  vtr1 = vt1 - (delz*wr2-dely*wr3);
+  vtr2 = vt2 - (delx*wr3-delz*wr1);
+  vtr3 = vt3 - (dely*wr1-delx*wr2);
+  vrel = vtr1*vtr1 + vtr2*vtr2 + vtr3*vtr3;
+
+  vrel1=vrel;
+  vrel = sqrt(vrel);
+  deltabar=shear[5];
+  delta=radsum-r;
+  // normal force = Hertzian contact + normal velocity damping + plastic deformation
+  deltamax=shear[4];
+  svector[4]=deltamax;
+  Fmax=1.0;
+  ccel=1.0;
+  
+  //force calcul
+  
+
+
+
+		/* 
+
+  damp = meff*gamman*vnnr*rsqinv;
+  if (delta >= deltamax) { // pure elastic contact, add "&& vrel > 0" for loading
+    deltamax = delta; //maximum delta during contact
+    
+    if (delta <= deltay) {
+      ccel = polyhertz*(kn*delta*rinv-damp);
+      svector[5]=0;	
+      svector[6]=polyhertz*kn*1.5;
+	  svector[7]=delta;
+	  svector[8]=0;	
+      
+    } else { // mixed elastic plastic, add "&& vrel > 0" for loading
+      	
+      deltap = cp*reff; //delta value at pure plastic flow
+      caradp = sqrt(2*reff*deltap); //contact area at yield
+      phi1 = 1/cosh((1+weight)*(delta-deltay)/(deltap-deltay)); //contribution to elastic deformation
+      phi2 = 1 - 1/cosh((1-weight)*(delta-deltay)/(deltap-deltay)); //contribution to plastic deformation
+      carad = sqrt(reff*delta*(1+phi2));
+      ccel = phi1*polyhertz*(kn*delta*rinv-damp) + phi2*knp*rinv*pow(carad,n)/pow(caradp,(n-2));
+      deltabar = delta*(1-ccel*r/(kn*polyhertz*delta)); //unrecoverable delta
+      reffbar = ccel*ccel*r*r/(kn*kn*pow((deltamax-deltabar),3)); //unrecoverable reff
+      svector[5]=1;	
+      coshp=cosh((delta-deltay)*(weight+1)/(deltap-deltay));
+      coshn=cosh((delta-deltay)*(weight-1)/(deltap-deltay));
+      sinhp=sinh((delta-deltay)*(weight+1)/(deltap-deltay));
+      sinhn=sinh((delta-deltay)*(weight-1)/(deltap-deltay));
+	  t1=3*sqrt(delta)*kn*sqrt(reff)/(2*coshp);
+	  t2=-pow(delta,1.5)*kn*sqrt(reff)*sinhp*(1+weight)/(coshp*coshp*(deltap-deltay));
+	  t31=pii*pow(2,1-n/2)*deltap*n*p0*reff;
+	  t32=(reff*(1/coshn-2)-(delta*reff*sinhn*(weight-1))/(coshn*coshn*(deltap-deltay)));
+	  t33=(1/coshn-1);
+	  t34=pow((-delta*reff*(1/coshn-2)),n/2-1);
+	  t3=t31*t32*t33*t34/(2*pow(deltap*reff,n/2));
+	  t41=pii*pow(2,1-n/2)*deltap*p0*reff*sinhn*(weight-1)*pow(-delta*reff*(1/coshn-2),n/2);
+	  t4=t41/(coshn*coshn*pow(deltap*reff,n/2)*(deltap-deltay));
+	  svector[7]=delta;
+	  svector[8]=shear[5];
+	  
+	  
+	  
+	  
+
+
+      svector[6]=t1+t2+t3+t4;
+    }
+  } else if (deltamax <= deltay) {
+    ccel = polyhertz*(kn*delta*rinv-damp); 
+    svector[5]=0;        
+    svector[6]=1.5*kn*polyhertz;
+	svector[7]=delta;
+	svector[8]=shear[5];deltabar;
+  } else if (delta>shear[5]) {
+    ccel = sqrt(shear[3]*(delta-deltabar))*(kn*(delta-deltabar)*rinv-damp);
+    svector[5]=-1;
+    svector[6]=1.5*kn*sqrt(shear[3]*(delta-deltabar));
+	svector[7]=delta;
+	svector[8]=shear[5];deltabar;
+  } else {
+    ccel = 0;
+    svector[5]=0;	
+    svector[6]=0;
+	svector[7]=delta;
+	svector[8]=0;
+  }
+  
+  if (delta>shear[5] && delta<shear[4]) {
+    ccel = sqrt(shear[3]*(delta-deltabar))*(kn*(delta-deltabar)*rinv-damp);
+    svector[5]=-1;
+    svector[6]=1.5*kn*sqrt(shear[3]*(delta-deltabar));
+    svector[7]=delta;
+    svector[8]=shear[5];deltabar;
+  }
+ */
+
+  // shear history effects
+  // neighprev = index of found neigh on previous call
+  // search entire jnum list of neighbors of I for neighbor J
+  // start from neighprev, since will typically be next neighbor
+  // reset neighprev to 0 as necessary
+
+
+
+  for (int jj = 0; jj < jnum; jj++) {
+    neighprev++;
+    if (neighprev >= jnum) neighprev = 0;
+    if (touch[neighprev] == j) break;
+  }
+
+  shrmag = sqrt(shear[0]*shear[0] + shear[1]*shear[1] +
+                shear[2]*shear[2]);
+
+  // rotate shear displacements
+
+  rsht = shear[0]*delx + shear[1]*dely + shear[2]*delz;
+  rsht *= rsqinv;
+
+  // tangential forces = shear + tangential velocity damping
+
+  fs1 = -polyhertz * (kt*shear[0] + meff*gammat*vtr1);
+  fs2 = -polyhertz * (kt*shear[1] + meff*gammat*vtr2);
+  fs3 = -polyhertz * (kt*shear[2] + meff*gammat*vtr3);
+
+  // rescale frictional displacements and forces if needed
+
+  fs = sqrt(fs1*fs1 + fs2*fs2 + fs3*fs3);
+  fn = xmu * fabs(ccel*r);
+
+  if (fs > fn) {
+    if (shrmag != 0.0) {
+      fs1 *= fn/fs;
+      fs2 *= fn/fs;
+      fs3 *= fn/fs;
+      fs *= fn/fs;
+    } else fs1 = fs2 = fs3 = fs = 0.0;
+  }
+
+  // set all forces and return no energy
+
+  fforce = ccel;
+  svector[0] = fs1;
+  svector[1] = fs2;
+  svector[2] = fs3;
+  svector[3] = rsq-radsum;
+  svector[4]=shear[4];
+  svector[6]=Fmax;
+  svector[7]=ccel;
+  svector[8]=0;
+  
+  
+  return 0.0;
+}
